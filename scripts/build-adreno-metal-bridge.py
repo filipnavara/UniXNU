@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build the native Metal bridge (drivers/AdrenoMetal/bridge/NativeMetalBridge.rs): the pinned metal2vulkan runtime behind a C ABI, as a static library.
 
---target ios (default) cross-builds for arm64-apple-ios17.0, --target ios27 for arm64e-apple-ios27.0 (nightly, std built from source), --target host for the macOS host simulation. The runtime's own example library
+--target ios (default) cross-builds for arm64-apple-ios17.0, --target ios27 for arm64e-apple-ios27.0 and --target macos27 for arm64e-apple-macos27.0 (nightly, std built from source), --target host for the macOS host simulation. The runtime's own example library
 (runtime_examples.ll) and its function-constant fixture are assembled to AIR with llvm-as and embedded for the self-tests. Only generated build files hold local paths; nothing here
 is committed. Output: build/adreno-metal-bridge/<target>/libadreno_metal_bridge.a"""
 import argparse
@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PIN = json.loads((ROOT / 'scripts/data/gpu-metal-vulkan-inputs.json').read_text())['translator']['commit']
 SOURCE = ROOT / '.cache/gpu-reference/metal2vulkan'
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument('--target', choices=['ios', 'ios27', 'host'], default='ios')
+parser.add_argument('--target', choices=['ios', 'ios27', 'macos27', 'host'], default='ios')
 parser.add_argument('--manifest-only', action='store_true',
                     help='write build/adreno-metal-bridge/Cargo.toml (patched source, fixtures) and stop before cargo, for `cargo fetch`')
 args = parser.parse_args()
@@ -25,20 +25,18 @@ if subprocess.check_output(['git', '-C', str(SOURCE), 'rev-parse', 'HEAD'], text
     raise SystemExit('Translator revision differs from the qualified source pin')
 PATCHES = [ROOT / 'drivers/AdrenoMetal/bridge/patches' / name for name in [
     # Each stacks on the source the ones before it leave.
-    '0001-optional-constant-output-members.patch', '0002-resource-wait-storage-dependencies.patch',
+    '0002-resource-wait-storage-dependencies.patch',
     '0003-cache-device-entry-point-priming.patch', '0004-fold-constant-global-field-loads.patch',
     # A draw whose pipeline the driver refused binds nothing (int-170: tu_CmdBindPipeline in the render server).
     '0005-skip-draws-without-a-pipeline.patch',
     # A batch's barrier globals on the stack, and the neutral resources' maps by the runtime's key hash.
     '0006-batch-barriers-and-key-hash-neutral-maps.patch',
-    # From the DroidVM board's translator patches: a cache directory a sandboxed process may not write, llvm.bitreverse, a patch
-    # function with no control points, and Core Image kernel libraries (file_type 1) loaded as Metal loads them.
-    '0007-optional-shader-cache-directory.patch', '0008-llvm-bitreverse.patch', '0009-patch-with-no-control-points.patch',
-    '0010-core-image-kernel-libraries.patch',
-    # A two-plane surface's shadow starts as its memory lies; the Astronomy wallpaper's extended-range sRGB blends take the rounded
-    # model; pooled blocks start at 4 MiB and grow (the render server alone held 1 GiB of wired memory).
-    '0011-two-plane-shadow-as-memory-lies.patch', '0012-srgb-extended-range-blend-rounded-model.patch',
-    '0013-growing-memory-blocks.patch',
+    # From the DroidVM board's translator patches: a cache directory a sandboxed process may not write, and a patch function with no
+    # control points.
+    '0007-optional-shader-cache-directory.patch', '0009-patch-with-no-control-points.patch',
+    # A two-plane surface's shadow starts as its memory lies; pooled blocks start at 4 MiB and grow (the render server alone held 1 GiB
+    # of wired memory).
+    '0011-two-plane-shadow-as-memory-lies.patch', '0013-growing-memory-blocks.patch',
     # HostPageTexturePolicy::InPlaceWrites: textures over surfaces and padded buffers are images over their bytes, rendered and written
     # too, where their tile stores stay within their rows, instead of shadows copied in and out every pass.
     '0014-in-place-written-textures.patch', '0015-in-place-written-host-page-textures.patch',
@@ -64,18 +62,33 @@ PATCHES = [ROOT / 'drivers/AdrenoMetal/bridge/patches' / name for name in [
     # The threads that bring command buffers to their handlers run at the user-interactive class and the compile threads at least at
     # the user-initiated class on iOS too, not on macOS alone: on the iPad they ran at the default class and woke up to 50 ms late.
     '0023-quality-of-service-on-ios.patch',
-    # The host's diagnostics switch (SHENG_DIAG, from the boot argument sheng-diag=1): without it the stage ring and the allocation sites
+    # The host's diagnostics switch (SHENG_DIAG, from the boot argument diag=1): without it the stage ring and the allocation sites
     # keep nothing. The stage ring also marks the steps inside a batch's submission (SubmitStep: placed, gathered, vkQueueSubmit, changes).
     '0024-diagnostics-switch-and-submit-steps.patch',
-    # Preserve specialized link names and source definitions; share large indexed constants and expose Vulkan allocation sizes.
+    # Share large indexed constants, read constant GEP offsets, expose Vulkan allocation sizes and name a made function.
     '0025-specialized-links-shared-constants-and-allocation-size.patch',
     '0026-frame-diagnostic-links.patch',
-    '0027-bounded-image-reuse-and-retired-release.patch',
-    '0028-guard-memory-release-test-worker.patch',
+    # Pooled and room-keeper image blocks become spares and serve later placements; the room worker ages them. Frees are upstream's
+    # free thread.
+    '0027-bounded-image-reuse.patch',
     '0029-latency-stage-selection.patch',
     # Spare image blocks have no byte limit (they age, go when a block cannot be made and on memory pressure), and the room keeper takes
     # a spare block before it makes a new one: the limit freed spares the render server made again within seconds, each a fresh wiring.
-    '0030-spare-image-blocks-give-room.patch']]
+    '0030-spare-image-blocks-give-room.patch',
+    # Live blocks by kind and size class and the driver's commitment of lazily allocated ones, for the MK and ML rows.
+    '0031-memory-kinds-by-size.patch',
+    # A cache hit stops refreshing access times after the platform refuses it once.
+    '0032-shader-cache-touch-refused-once.patch',
+    # The room thread's timed spare aging runs inside an exit-guard section.
+    '0033-room-thread-ages-spares-in-a-section.patch',
+    # Parked objects and kept empty blocks go by time, so a discarded volatile resource's block is returned without a later submission.
+    '0034-parked-objects-and-kept-blocks-age-by-time.patch',
+    # A two-plane YCbCr surface texture that is only sampled is made over the surface's planes alone, its converted image only at a
+    # binding that needs one.
+    '0035-ycbcr-surface-textures-over-their-planes.patch',
+    # A read-only system cache layer a device asks for what its own cache directory lacks, read only where every level is owned by a
+    # trusted user and not writable by group or others; and a cache directory whose entries everyone may read, for the process that fills it.
+    '0036-system-shader-cache-layer.patch']]
 
 
 def git_tree(*steps):
@@ -140,14 +153,15 @@ manifest.write_text('\n'.join([
 if args.manifest_only:
     print(manifest)
     raise SystemExit(0)
-triple = {'ios': 'aarch64-apple-ios', 'ios27': 'arm64e-apple-ios', 'host': 'aarch64-apple-darwin'}[args.target]
+triple = {'ios': 'aarch64-apple-ios', 'ios27': 'arm64e-apple-ios', 'macos27': 'arm64e-apple-darwin', 'host': 'aarch64-apple-darwin'}[args.target]
+ARM64E = args.target in ('ios27', 'macos27')
 # arm64e has no prebuilt std: it is built from rust-src (RUSTC_BOOTSTRAP for -Z); the iPadOS 27 processes that load the plugin are arm64e.
-cargo = ['cargo', '+1.98.0'] + (['-Z', 'build-std=std,panic_unwind'] if args.target == 'ios27' else [])
+cargo = ['cargo', '+1.98.0'] + (['-Z', 'build-std=std,panic_unwind'] if ARM64E else [])
 # The translator source the runtime is built from (its pin and recorded patches), which keys the shader cache: shader priming keeps what it
 # finished while this stays the same (PrimeShaders.h).
 runtime_id = hashlib.sha256((PIN + '\n' + states[-1]).encode()).hexdigest()[:32]
-env = dict(os.environ, NMB_RUNTIME_ID=runtime_id, NMB_FIXTURE_AIR=str(air), NMB_FC_AIR=str(fc_air), NMB_SCANOUT_AIR=str(scanout_air), IPHONEOS_DEPLOYMENT_TARGET='27.0' if args.target == 'ios27' else '17.0', MACOSX_DEPLOYMENT_TARGET='14.0')
-if args.target == 'ios27':
+env = dict(os.environ, NMB_RUNTIME_ID=runtime_id, NMB_FIXTURE_AIR=str(air), NMB_FC_AIR=str(fc_air), NMB_SCANOUT_AIR=str(scanout_air), IPHONEOS_DEPLOYMENT_TARGET='27.0' if args.target == 'ios27' else '17.0', MACOSX_DEPLOYMENT_TARGET='27.0' if args.target == 'macos27' else '14.0')
+if ARM64E:
     env['RUSTC_BOOTSTRAP'] = '1'
 target_dir = ROOT / 'build/m2v-target'
 log = out / ('build-%s.log' % args.target)
