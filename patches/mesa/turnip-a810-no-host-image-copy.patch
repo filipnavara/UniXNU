@@ -1,0 +1,25 @@
+--- a/src/freedreno/vulkan/tu_device.cc	2026-11-10 19:19:53
++++ b/src/freedreno/vulkan/tu_device.cc	2026-11-10 19:19:53
+@@ -336,7 +336,10 @@
+       .EXT_global_priority_query = tu_is_vk_1_1(device),
+       .EXT_graphics_pipeline_library = true,
+       .EXT_hdr_metadata = true,
+-      .EXT_host_image_copy = true,
++      /* asteroids: off. The CPU tiling copy (fdl6_memcpy_linear_to_tiled) lays texels out otherwise than the A810's
++       * tiled images, so textures written through host image copies (CoreUI images in Settings) read back block-scrambled;
++       * without it metal2vulkan uploads through a staging buffer and a GPU copy. */
++      .EXT_host_image_copy = false,
+       .EXT_host_query_reset = true,
+       .EXT_image_2d_view_of_3d = true,
+       .EXT_image_drm_format_modifier = true,
+@@ -759,8 +762,8 @@
+    /* VK_EXT_graphics_pipeline_library */
+    features->graphicsPipelineLibrary = true;
+ 
+-   /* VK_EXT_host_image_copy */
+-   features->hostImageCopy = true;
++   /* VK_EXT_host_image_copy (asteroids: off, see the extension table) */
++   features->hostImageCopy = false;
+ 
+    /* VK_EXT_shader_image_atomic_int64 */
+    features->shaderImageInt64Atomics = pdevice->info->props.has_64b_image_atomics;
