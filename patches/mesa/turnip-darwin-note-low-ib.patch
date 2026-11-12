@@ -1,0 +1,69 @@
+diff --git a/src/freedreno/vulkan/tu_cs.h b/src/freedreno/vulkan/tu_cs.h
+--- a/src/freedreno/vulkan/tu_cs.h
++++ b/src/freedreno/vulkan/tu_cs.h
+@@ -374,6 +374,13 @@
+    tu_cs_emit(cs, value);
+ }
+ 
++#ifdef TU_HAS_DARWIN
++/* asteroids: an indirect buffer below the client range (every NativeAdreno client address is at or above 4 GiB) is noted once per
++ * process with what its BO holds (tu_knl_darwin.cc). */
++void
++tu_darwin_note_low_ib(struct tu_device *dev, const struct tu_bo *bo, uint64_t iova, uint32_t offset, uint32_t size, char where);
++#endif
++
+ /**
+  * Emit a CP_INDIRECT_BUFFER command packet.
+  */
+@@ -385,6 +392,10 @@
+    assert(entry->size % sizeof(uint32_t) == 0);
+    assert(entry->offset % sizeof(uint32_t) == 0);
+ 
++#ifdef TU_HAS_DARWIN
++   if (unlikely(!((entry->bo->iova + entry->offset) >> 32)))
++      tu_darwin_note_low_ib(cs->device, entry->bo, entry->bo->iova + entry->offset, entry->offset, entry->size, 'c');
++#endif
+    tu_cs_emit_pkt7(cs, CP_INDIRECT_BUFFER, 3);
+    tu_cs_emit_qw(cs, entry->bo->iova + entry->offset);
+    tu_cs_emit(cs, entry->size / sizeof(uint32_t));
+@@ -395,6 +406,10 @@
+ tu_cs_emit_state_ib(struct tu_cs *cs, struct tu_draw_state state)
+ {
+    if (state.size) {
++#ifdef TU_HAS_DARWIN
++      if (unlikely(!(state.iova >> 32)))
++         tu_darwin_note_low_ib(cs->device, NULL, state.iova, 0, state.size, 's');
++#endif
+       tu_cs_emit_pkt7(cs, CP_INDIRECT_BUFFER, 3);
+       tu_cs_emit_qw(cs, state.iova);
+       tu_cs_emit(cs, state.size);
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -610,6 +610,26 @@
+    int len = snprintf(req.text, sizeof(req.text), "AF %c s%llu f%x k%x u%llu h%llu c%llu %.12s", step, (unsigned long long)(size >> 10),
+                       flags, status, (unsigned long long)(used >> 20), (unsigned long long)(largest >> 20),
+                       (unsigned long long)(retire->cache_bytes >> 20), getprogname());
++   req.bytes = (uint32_t)MIN2(MAX2(len, 0), (int)sizeof(req.text));
++   (void)dw_call(NativeAdrenoMethodSetMetadata, &req, sizeof(req), NULL, 0);
++}
++
++/* asteroids: the first indirect buffer of this process whose address has no upper word (tu_cs_emit_ib: c, tu_cs_emit_state_ib: s), as
++ * one SetMetadata line like darwin_note_failure's (64 bytes): "LI<c|s> i<iova> b<its BO's iova> o<offset> s<BO size> r<refcnt> m<mapped>
++ * <process>". A BO whose fields are all zero was already finished (darwin_bo_finish zeroes it); b0 with s and r set is a BO never given
++ * an address. */
++void
++tu_darwin_note_low_ib(struct tu_device *dev, const struct tu_bo *bo, uint64_t iova, uint32_t offset, uint32_t size, char where)
++{
++   static uint32_t noted;
++   (void)size;
++   if (!dev || p_atomic_inc_return(&noted) != 1)
++      return;
++   NativeAdrenoAbiMetadata req = {};
++   req.reserved = 0x4641494cu;   /* 'FAIL': no handler, so only the report line keeps it */
++   int len = snprintf(req.text, sizeof(req.text), "LI%c i%llx b%llx o%x s%llx r%d m%d %.10s", where, (unsigned long long)iova,
++                      bo ? (unsigned long long)bo->iova : 0ull, offset, bo ? (unsigned long long)bo->size : 0ull,
++                      bo ? bo->refcnt : -1, bo && bo->map ? 1 : 0, getprogname());
+    req.bytes = (uint32_t)MIN2(MAX2(len, 0), (int)sizeof(req.text));
+    (void)dw_call(NativeAdrenoMethodSetMetadata, &req, sizeof(req), NULL, 0);
+ }
