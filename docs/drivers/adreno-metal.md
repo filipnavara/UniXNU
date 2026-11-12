@@ -25,13 +25,15 @@ Unused owned image backing is reused by pooled and dedicated images. Extra spare
 
 Clients with the same UID use `Library/Caches/org.unixnu.metal` under their account home when writable. Sandbox restrictions select a private cache. `NATIVE_METAL_SHARED_CACHE_DIR` selects another shared root; an empty value disables sharing. The cache covers Apple frontend output, runtime artifacts and Turnip IR3. Concurrent pack imports use distinct temporary files. Pipeline journals are per process.
 
-Render encoder calls lower at the call, commits submit through the runtime's scheduler thread, and no pipelines are prepared ahead of use. `metal-flow=1` enables three metal2vulkan paths for testing:
+Three metal2vulkan work placements are on by default. `metal-flow=<bits>` selects them: 1 for the first, 2 for the second, 4 for the third, and 0 for none:
 
 - Render encoder calls lower on the runtime's lowering thread. A refusal found while lowering fails the command buffer.
 - A commit submits on the committing thread when no other submission pass is running.
 - Each program appends its pipeline records to `pipeline-records-<name>.bin` in the cache. A new device makes the recorded pipelines again in the background at the utility class.
 
-These paths stay off because they showed no measured frame-rate gain on sheng, and one test boot stopped presenting at the logo. Either value of `metal-flow=` logs the `FL` counts to os_log every ten seconds when they change.
+Any value of `metal-flow=` logs the `FL` counts to os_log every ten seconds when they change.
+
+Turnip chooses tile memory or system memory for each render pass, and concurrent binning is on. `tu-debug=<flags>` sets `TU_DEBUG` for every Metal process: `gmem` renders every pass in tile memory and `nocb` turns concurrent binning off. `tum=a` alternates between Turnip's choice and tile memory every eight seconds for measurement.
 
 Logical Metal queues share one Vulkan queue and kernel queue per process. The frontend forwards the most urgent **current** request among live queues. Lowering or destroying a queue removes its boost. Getters report each queue's own request; setters report backend acceptance. The kernel chooses foreground or background priority from the task's GPU role. Priority policy does not use process names.
 
@@ -56,3 +58,5 @@ With `gpu-trace=1`, kernel event 65 identifies the Metal device and command queu
 `wallpaper-freeze=1` isolates wallpaper rendering. A Poster renderer retains its first successfully drawn and stored IOSurface output of at least two million pixels, then parks later command buffers before runtime submission. Parked buffers remain committed and unscheduled; their owners and queue leases stay retained. Previously submitted work completes normally. PosterBoard, backboardd and other clients continue submitting. The mode defaults to off.
 
 Detailed latency records identify slow encoder calls, callback invoke addresses and resource destruction. Kernel sampling of the render, encode and completion threads correlates upstream waits.
+
+With `diag=1`, encoding batch end records (type 14, phase 3) store encoding-thread CPU microseconds in field `d`. Compare this with paired start/end wall time to distinguish work from waits. `TUC` reports Turnip BO cache lookups, hits, inserts, evictions and full flushes.

@@ -4,4 +4,4 @@
 
 Complete and validate [porting.toml](/porting/records) in the device repository to publish its subsystem record.
 
-Emilelu/UniXNU-mondrian/display: verification evidence needs a commit
+Emilelu/UniXNU-mondrian/storage: implemented work needs evidence
