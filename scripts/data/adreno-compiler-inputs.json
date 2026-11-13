@@ -72,7 +72,6 @@
     "patches/mesa/turnip-darwin-first-alloc-failure.patch",
     "patches/mesa/turnip-a810-no-host-image-copy.patch",
     "patches/mesa/turnip-darwin-note-low-ib.patch",
-    "patches/mesa/turnip-darwin-secondary-lifetime.patch",
     "patches/mesa/turnip-darwin-bo-finish-clears-under-lock.patch"
   ],
   "integer_fma_reference": {
