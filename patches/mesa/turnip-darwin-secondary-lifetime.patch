@@ -1,0 +1,332 @@
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.h b/src/freedreno/vulkan/tu_cmd_buffer.h
+--- a/src/freedreno/vulkan/tu_cmd_buffer.h
++++ b/src/freedreno/vulkan/tu_cmd_buffer.h
+@@ -757,6 +757,24 @@
+    bool vsc_initialized;
+ 
+    bool prev_fsr_is_null;
++#ifdef TU_HAS_DARWIN
++   /* asteroids: secondary lifetime check (tu_darwin_check_secondaries, tu_cmd_buffer.cc). darwin_gen changes when the command
++    * buffer is reset or destroyed, darwin_how/darwin_tid say how and on which thread; a primary keeps the secondaries whose
++    * draw_cs it took in a render pass (tu_CmdExecuteCommands), each with its generation then. */
++   uint32_t darwin_gen;
++   uint32_t darwin_how;
++   uint64_t darwin_tid;
++   uint32_t darwin_secondary_count, darwin_secondary_overflow;
++   struct { struct tu_cmd_buffer *cmd; uint32_t gen; } darwin_secondaries[64];
++   /* The thread that began the recording; (a secondary) how often a primary executed it since, and that primary's beginning thread
++    * (copied, never read through a pointer: the primary may be gone). */
++   char darwin_begin_name[16];
++   uint32_t darwin_executed;
++   char darwin_executed_by[16];
++   /* At the last reset (vkFreeCommandBuffers recycles through it): the state then and the resetting thread. */
++   int darwin_reset_state;
++   char darwin_reset_name[16];
++#endif
+ };
+ VK_DEFINE_HANDLE_CASTS(tu_cmd_buffer, vk.base, VkCommandBuffer,
+                        VK_OBJECT_TYPE_COMMAND_BUFFER)
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -19,6 +19,61 @@
+ #include "common/freedreno_lrz.h"
+ #include "common/freedreno_vrs.h"
+ #include "tu_autotune.h"
++#ifdef TU_HAS_DARWIN
++#include <pthread.h>
++void tu_darwin_note_text(struct tu_device *dev, const char *text);
++/* The command buffer this thread is destroying (tu_cmd_buffer_destroy), described for darwin_bo_finish's records (tu_knl_darwin.cc):
++ * "L<p|s> S<state at destroy> U<state of the primary that executed it, - none or since reset> f<destroying thread> b<beginning thread>". */
++extern thread_local char tu_darwin_destroying[48];
++
++static uint64_t
++tu_darwin_tid(void)
++{
++   uint64_t tid = 0;
++   pthread_threadid_np(NULL, &tid);
++   return tid;
++}
++
++/* asteroids: a thread's name without the runtime's "metal2vulkan-" prefix, so the part that tells them apart fits a 64-byte line. */
++static const char *
++tu_darwin_short_name(const char *name)
++{
++   static const char prefix[] = "metal2vulkan-";
++   if (!name[0])
++      return "?";
++   return strncmp(name, prefix, sizeof(prefix) - 1) ? name : name + sizeof(prefix) - 1;
++}
++
++/* asteroids: the command buffer changed (reset 'R', destroyed 'F'); a primary that took its draw_cs entries sees the new generation. */
++static void
++tu_darwin_cmd_changed(struct tu_cmd_buffer *cmd, char how)
++{
++   cmd->darwin_tid = tu_darwin_tid();
++   cmd->darwin_how = (uint32_t)how;
++   p_atomic_inc(&cmd->darwin_gen);
++   cmd->darwin_secondary_count = cmd->darwin_secondary_overflow = 0;
++}
++
++/* asteroids: before a render pass emits draw_cs, every secondary whose entries it took must be the one it took them from (the
++ * entries point into the secondary's command stream BOs). One SetMetadata line for the first mismatch of the process:
++ * "SX <how> g<gen then>/<now> t<thread that changed it>/<this thread> i<index>/<count>[+overflow] <where>". */
++static void
++tu_darwin_check_secondaries(struct tu_cmd_buffer *cmd, char where)
++{
++   for (uint32_t i = 0; i < cmd->darwin_secondary_count; i++) {
++      struct tu_cmd_buffer *s = cmd->darwin_secondaries[i].cmd;
++      const uint32_t now = p_atomic_read(&s->darwin_gen);
++      if (now == cmd->darwin_secondaries[i].gen)
++         continue;
++      char text[64];
++      snprintf(text, sizeof(text), "SX %c g%u/%u t%llx/%llx i%u/%u+%u %c", (char)s->darwin_how, cmd->darwin_secondaries[i].gen, now,
++               (unsigned long long)s->darwin_tid, (unsigned long long)tu_darwin_tid(), i, cmd->darwin_secondary_count,
++               cmd->darwin_secondary_overflow, where);
++      tu_darwin_note_text(cmd->device, text);
++      return;
++   }
++}
++#endif
+ #include "tu_buffer.h"
+ #include "tu_clear_blit.h"
+ #include "tu_cs.h"
+@@ -4320,6 +4375,9 @@
+ 
+    tu_autotune::rp_key_opt rp_key = cmd_buffer->device->autotune->emit_preempt_latency_tracking_rp_hash(cmd_buffer);
+ 
++#ifdef TU_HAS_DARWIN
++   tu_darwin_check_secondaries(cmd_buffer, 'r');
++#endif
+    tu_autotune::rp_ctx_t rp_ctx = NULL;
+    const bool sysmem = use_sysmem_rendering(cmd_buffer, &rp_ctx, rp_key);
+    const uint32_t seq = tu_pass_trace_on() ? tu_note_render_mode(cmd_buffer, sysmem) : 0;
+@@ -4332,6 +4390,9 @@
+       tu_cmd_render_tiles<CHIP>(cmd_buffer, rp_ctx, fdm_offsets);
+    if (stamps)
+       tu_pass_stamp<CHIP>(&cmd_buffer->cs, stamps + 8);
++#ifdef TU_HAS_DARWIN
++   cmd_buffer->darwin_secondary_count = cmd_buffer->darwin_secondary_overflow = 0;   /* draw_cs is discarded after the pass */
++#endif
+ }
+ 
+ static void tu_reset_render_pass(struct tu_cmd_buffer *cmd_buffer)
+@@ -4431,6 +4492,19 @@
+    struct tu_cmd_buffer *cmd_buffer =
+       container_of(vk_cmd_buffer, struct tu_cmd_buffer, vk);
+ 
++#ifdef TU_HAS_DARWIN
++   {
++      char name[16] = "";
++      pthread_getname_np(pthread_self(), name, sizeof(name));
++      /* "D L<p|s> S<state now>/<at the last reset> E<executed by a primary since its begin> f<destroying thread> r<resetting> b<beginning>" */
++      snprintf(tu_darwin_destroying, sizeof(tu_darwin_destroying), "D L%c S%d/%d E%u f%.8s r%.8s b%.8s",
++               cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY ? 'p' : 's', (int)cmd_buffer->vk.state,
++               cmd_buffer->darwin_reset_state, cmd_buffer->darwin_executed, tu_darwin_short_name(name),
++               cmd_buffer->darwin_reset_name[0] ? tu_darwin_short_name(cmd_buffer->darwin_reset_name) : "-",
++               tu_darwin_short_name(cmd_buffer->darwin_begin_name));
++   }
++   tu_darwin_cmd_changed(cmd_buffer, 'F');
++#endif
+    tu_cs_finish(&cmd_buffer->cs);
+    tu_cs_finish(&cmd_buffer->draw_cs);
+    tu_cs_finish(&cmd_buffer->tile_store_cs);
+@@ -4498,6 +4572,9 @@
+ 
+    vk_command_buffer_finish(&cmd_buffer->vk);
+    vk_free(&cmd_buffer->vk.pool->alloc, cmd_buffer);
++#ifdef TU_HAS_DARWIN
++   tu_darwin_destroying[0] = 0;
++#endif
+ }
+ 
+ static void
+@@ -4511,6 +4588,20 @@
+    if (TU_DEBUG_START(CHECK_CMD_BUFFER_STATUS))
+       status_check_result = tu_cmd_buffer_status_check_idle(cmd_buffer);
+ 
++#ifdef TU_HAS_DARWIN
++   cmd_buffer->darwin_reset_state = (int)cmd_buffer->vk.state;
++   pthread_getname_np(pthread_self(), cmd_buffer->darwin_reset_name, sizeof(cmd_buffer->darwin_reset_name));
++   /* The BOs tu_cs_reset frees below carry this: "R L<p|s> S<state before the reset> E<executed by a primary since its begin>
++    * t<resetting thread> b<beginning thread> u<the executing primary's beginning thread>". */
++   snprintf(tu_darwin_destroying, sizeof(tu_darwin_destroying), "R L%c S%d E%u t%.8s b%.8s u%.8s",
++            cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY ? 'p' : 's', cmd_buffer->darwin_reset_state,
++            cmd_buffer->darwin_executed, tu_darwin_short_name(cmd_buffer->darwin_reset_name),
++            tu_darwin_short_name(cmd_buffer->darwin_begin_name),
++            cmd_buffer->darwin_executed ? tu_darwin_short_name(cmd_buffer->darwin_executed_by) : "-");
++   tu_darwin_cmd_changed(cmd_buffer, 'R');
++   cmd_buffer->darwin_executed = 0;
++   cmd_buffer->darwin_executed_by[0] = 0;
++#endif
+     vk_command_buffer_reset(&cmd_buffer->vk);
+ 
+     if (TU_DEBUG_START(CHECK_CMD_BUFFER_STATUS) &&
+@@ -4594,6 +4685,9 @@
+ 
+    util_dynarray_clear(&cmd_buffer->vis_stream_bos);
+    util_dynarray_clear(&cmd_buffer->vis_stream_cs_bos);
++#ifdef TU_HAS_DARWIN
++   tu_darwin_destroying[0] = 0;
++#endif
+ }
+ 
+ const struct vk_command_buffer_ops tu_cmd_buffer_ops = {
+@@ -4659,6 +4753,9 @@
+    VkResult result = tu_cmd_buffer_begin(cmd_buffer, pBeginInfo);
+    if (result != VK_SUCCESS)
+       return result;
++#ifdef TU_HAS_DARWIN
++   pthread_getname_np(pthread_self(), cmd_buffer->darwin_begin_name, sizeof(cmd_buffer->darwin_begin_name));
++#endif
+ 
+    /* setup initial configuration into command buffer */
+    if (cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY) {
+@@ -6590,6 +6687,16 @@
+          tu_lrz_flush_valid_at_secondary_rp_boundary(
+             cmd, secondary->state.lrz, &cmd->draw_cs);
+ 
++#ifdef TU_HAS_DARWIN
++         if (cmd->darwin_secondary_count < ARRAY_SIZE(cmd->darwin_secondaries)) {
++            cmd->darwin_secondaries[cmd->darwin_secondary_count].cmd = secondary;
++            cmd->darwin_secondaries[cmd->darwin_secondary_count++].gen = p_atomic_read(&secondary->darwin_gen);
++         } else {
++            cmd->darwin_secondary_overflow++;
++         }
++         secondary->darwin_executed++;
++         memcpy(secondary->darwin_executed_by, cmd->darwin_begin_name, sizeof(secondary->darwin_executed_by));
++#endif
+          result = tu_cs_add_entries(&cmd->draw_cs, &secondary->draw_cs);
+          if (result != VK_SUCCESS) {
+             vk_command_buffer_set_error(&cmd->vk, result);
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -612,6 +612,68 @@
+                       (unsigned long long)(retire->cache_bytes >> 20), getprogname());
+    req.bytes = (uint32_t)MIN2(MAX2(len, 0), (int)sizeof(req.text));
+    (void)dw_call(NativeAdrenoMethodSetMetadata, &req, sizeof(req), NULL, 0);
++}
++
++/* asteroids: the last 256 BOs darwin_bo_finish zeroed, with where from (backtrace), so a command stream that still names one
++ * (tu_darwin_note_low_ib) can tell who finished it: "LF h<handle low word> i<iova> s<KiB> a<ms ago> <caller offsets in this
++ * library, hex>" as a second line beside LI. */
++#include <execinfo.h>
++#include <dlfcn.h>
++struct darwin_finish_record {
++   const void *bo;
++   uint64_t handle, iova, size, ns;
++   void *frames[7];
++   char destroying[48];
++};
++thread_local char tu_darwin_destroying[48];
++static struct darwin_finish_record darwin_finishes[256];
++static uint32_t darwin_finish_count;
++void tu_darwin_note_text(struct tu_device *dev, const char *text);
++
++static void
++darwin_record_finish(const struct tu_bo *bo)
++{
++   struct darwin_finish_record *r = &darwin_finishes[(p_atomic_inc_return(&darwin_finish_count) - 1) & 255];
++   r->bo = NULL;
++   r->handle = bo->darwin_handle;
++   r->iova = bo->iova;
++   r->size = bo->size;
++   r->ns = os_time_get_nano();
++   memset(r->frames, 0, sizeof(r->frames));
++   backtrace(r->frames, 7);
++   memcpy(r->destroying, tu_darwin_destroying, sizeof(r->destroying));
++   p_atomic_set(&r->bo, (const void *)bo);
++}
++
++static void
++darwin_note_finished(struct tu_device *dev, const struct tu_bo *bo)
++{
++   const uint32_t count = p_atomic_read(&darwin_finish_count);
++   Dl_info self = {};
++   dladdr((const void *)&darwin_note_finished, &self);
++   const uintptr_t base = (uintptr_t)self.dli_fbase;
++   for (uint32_t k = 0; k < 256 && k < count; k++) {
++      const struct darwin_finish_record *r = &darwin_finishes[(count - 1 - k) & 255];
++      if (p_atomic_read(&r->bo) != bo)
++         continue;
++      char text[64];
++      if (r->destroying[0]) {
++         /* Freed by tu_cmd_buffer_destroy: which command buffer and threads, rather than the stack (vkTrimCommandPool's). */
++         snprintf(text, sizeof(text), "LF a%llu %s", (unsigned long long)((os_time_get_nano() - r->ns) / 1000000), r->destroying);
++         tu_darwin_note_text(dev, text);
++         return;
++      }
++      int n = snprintf(text, sizeof(text), "LF h%x i%llx s%llu a%llu", (uint32_t)r->handle, (unsigned long long)r->iova,
++                       (unsigned long long)(r->size >> 10), (unsigned long long)((os_time_get_nano() - r->ns) / 1000000));
++      /* frames[0] is darwin_record_finish, [1] darwin_bo_finish: the callers from [2] on. */
++      for (unsigned f = 2; f < 7 && n > 0 && n < (int)sizeof(text) - 8; f++) {
++         const uintptr_t at = (uintptr_t)r->frames[f];
++         n += snprintf(text + n, sizeof(text) - n, " %lx", (unsigned long)(at >= base ? at - base : 0));
++      }
++      tu_darwin_note_text(dev, text);
++      return;
++   }
++   tu_darwin_note_text(dev, "LF none");
+ }
+ 
+ /* asteroids: the first indirect buffer of this process whose address has no upper word (tu_cs_emit_ib: c, tu_cs_emit_state_ib: s), as
+@@ -623,6 +685,8 @@
+ {
+    static uint32_t noted;
+    (void)size;
++   if (dev && bo && !bo->iova)
++      darwin_note_finished(dev, bo);
+    if (!dev || p_atomic_inc_return(&noted) != 1)
+       return;
+    NativeAdrenoAbiMetadata req = {};
+@@ -634,6 +698,40 @@
+    (void)dw_call(NativeAdrenoMethodSetMetadata, &req, sizeof(req), NULL, 0);
+ }
+ 
++/* asteroids: one diagnostic line per process for each tag (its first two characters), as darwin_note_failure's (64 bytes). */
++void tu_darwin_note_text(struct tu_device *dev, const char *text);
++void
++tu_darwin_note_text(struct tu_device *dev, const char *text)
++{
++   static char seen[8][2];
++   static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
++   if (!dev || !text || !text[0])
++      return;
++   pthread_mutex_lock(&lock);
++   unsigned i = 0;
++   for (; i < 8 && seen[i][0]; i++)
++      if (seen[i][0] == text[0] && seen[i][1] == text[1])
++         break;
++   const bool fresh = i < 8 && !seen[i][0];
++   if (fresh) {
++      seen[i][0] = text[0];
++      seen[i][1] = text[1];
++   }
++   pthread_mutex_unlock(&lock);
++   if (!fresh)
++      return;
++   /* "T " sends the line to the kernel's second report line (NativeAdrenoPublish.cpp runCore: the Turnip phase's line), which nothing
++    * else writes on this board, so the frequent PF lines on the first one never hide it; the board prints both on every change. */
++   NativeAdrenoAbiMetadata req = {};
++   req.reserved = 0x4641494cu;   /* 'FAIL': no handler, so only the report line keeps it */
++   req.text[0] = 'T';
++   req.text[1] = ' ';
++   const size_t len = strnlen(text, sizeof(req.text) - 2);
++   memcpy(req.text + 2, text, len);
++   req.bytes = (uint32_t)(len + 2);
++   (void)dw_call(NativeAdrenoMethodSetMetadata, &req, sizeof(req), NULL, 0);
++}
++
+ /* Hands the CPU lease, the kernel allocation and the GPU range of a BO back. VK_NOT_READY: the kernel still holds it (retry later);
+  * anything else is final (an unexpected kernel status loses the device). Called under retire->lock. */
+ static VkResult
+@@ -1201,6 +1299,8 @@
+       return;
+    }
+ 
++   darwin_record_finish(bo);
++
+    tu_debug_bos_del(dev, bo);
+    tu_dump_bo_del(dev, bo);
+ 

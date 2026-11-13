@@ -71,7 +71,8 @@
     "patches/mesa/turnip-a810-sysmem-ccu.patch",
     "patches/mesa/turnip-darwin-first-alloc-failure.patch",
     "patches/mesa/turnip-a810-no-host-image-copy.patch",
-    "patches/mesa/turnip-darwin-note-low-ib.patch"
+    "patches/mesa/turnip-darwin-note-low-ib.patch",
+    "patches/mesa/turnip-darwin-secondary-lifetime.patch"
   ],
   "integer_fma_reference": {
     "repository": "https://github.com/ucb-bar/berkeley-softfloat-3",
